@@ -2967,6 +2967,115 @@ def accumulate_particle_body_contact_force_and_hessian(
 
 
 @wp.kernel
+def fill_particle_body_contacts_per_color(
+    body_particle_contact_count: wp.array[int],
+    body_particle_contact_particle: wp.array[int],
+    particle_colors: wp.array[int],
+    color_contact_offsets: wp.array[wp.int32],
+    color_contact_capacities: wp.array[wp.int32],
+    color_contact_counts: wp.array[wp.int32],
+    color_contact_indices: wp.array[wp.int32],
+):
+    t_id = wp.tid()
+
+    if t_id >= body_particle_contact_count[0]:
+        return
+
+    particle_idx = body_particle_contact_particle[t_id]
+    if particle_idx < 0:
+        return
+
+    color = particle_colors[particle_idx]
+    # Single atomic counter doubles as the per-color slot index.
+    slot = wp.atomic_add(color_contact_counts, color, 1)
+    # Mesh-based contacts can exceed the Cartesian (particle × shape) bound for a color.
+    # Drop overflow writes; the accumulator clamps the read side via min(count, capacity).
+    if slot >= color_contact_capacities[color]:
+        return
+
+    color_contact_indices[color_contact_offsets[color] + slot] = t_id
+
+
+@wp.kernel
+def accumulate_particle_body_contact_force_and_hessian_by_color(
+    # inputs
+    dt: float,
+    current_color: int,
+    color_contact_offset: int,
+    color_contact_capacity: int,
+    color_contact_counts: wp.array[wp.int32],
+    color_contact_indices: wp.array[wp.int32],
+    pos_anchor: wp.array[wp.vec3],
+    pos: wp.array[wp.vec3],
+    # body-particle contact
+    friction_epsilon: float,
+    particle_radius: wp.array[float],
+    body_particle_contact_particle: wp.array[int],
+    # per-contact soft AVBD parameters for body-particle contacts (shared with rigid side)
+    body_particle_contact_penalty_k: wp.array[float],
+    body_particle_contact_material_kd: wp.array[float],
+    body_particle_contact_material_mu: wp.array[float],
+    shape_material_mu: wp.array[float],
+    shape_body: wp.array[int],
+    body_q: wp.array[wp.transform],
+    body_q_prev: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_com: wp.array[wp.vec3],
+    contact_shape: wp.array[int],
+    contact_body_pos: wp.array[wp.vec3],
+    contact_body_vel: wp.array[wp.vec3],
+    contact_normal: wp.array[wp.vec3],
+    # outputs: particle force and hessian
+    particle_forces: wp.array[wp.vec3],
+    particle_hessians: wp.array[wp.mat33],
+):
+    t_id = wp.tid()
+
+    # fill_particle_body_contacts_per_color uses color_contact_counts as an atomic
+    # slot counter; overflowing writes are dropped but the counter still increments,
+    # so clamp the read bound at the allocated per-color capacity.
+    limit = wp.min(color_contact_counts[current_color], color_contact_capacity)
+    if t_id >= limit:
+        return
+
+    contact_idx = color_contact_indices[color_contact_offset + t_id]
+    if contact_idx < 0:
+        return
+
+    particle_idx = body_particle_contact_particle[contact_idx]
+
+    # Read per-contact AVBD penalty and material properties shared with the rigid side
+    contact_ke = body_particle_contact_penalty_k[contact_idx]
+    contact_kd = body_particle_contact_material_kd[contact_idx]
+    contact_mu = body_particle_contact_material_mu[contact_idx]
+
+    body_contact_force, body_contact_hessian = evaluate_body_particle_contact(
+        particle_idx,
+        pos[particle_idx],
+        pos_anchor[particle_idx],
+        contact_idx,
+        contact_ke,
+        contact_kd,
+        contact_mu,
+        friction_epsilon,
+        particle_radius,
+        shape_material_mu,
+        shape_body,
+        body_q,
+        body_q_prev,
+        body_qd,
+        body_com,
+        contact_shape,
+        contact_body_pos,
+        contact_body_vel,
+        contact_normal,
+        dt,
+    )
+    wp.atomic_add(particle_forces, particle_idx, body_contact_force)
+    wp.atomic_add(particle_hessians, particle_idx, body_contact_hessian)
+
+
+@wp.kernel
 def solve_elasticity_tile(
     dt: float,
     particle_ids_in_color: wp.array[wp.int32],

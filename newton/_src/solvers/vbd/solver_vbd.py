@@ -34,9 +34,10 @@ from .particle_vbd_kernels import (
     _fill_adjacent_springs,
     _fill_adjacent_tets,
     # Topological filtering helper functions
-    accumulate_particle_body_contact_force_and_hessian,
+    accumulate_particle_body_contact_force_and_hessian_by_color,
     accumulate_self_contact_force_and_hessian,
     accumulate_spring_force_and_hessian,
+    fill_particle_body_contacts_per_color,
     # Planar DAT (Divide and Truncate) kernels
     apply_planar_truncation_parallel_by_collision,
     apply_truncation_ts,
@@ -428,6 +429,28 @@ class SolverVBD(SolverBase):
                 "model.particle_color_groups is empty! When using the SolverVBD you must call ModelBuilder.color() "
                 "or ModelBuilder.set_coloring() before calling ModelBuilder.finalize()."
             )
+
+        color_contact_capacities_np = np.array(
+            [group.size * self.model.shape_count for group in self.model.particle_color_groups], dtype=np.int32
+        )
+        color_contact_offsets_np = np.zeros_like(color_contact_capacities_np)
+        if color_contact_offsets_np.size > 1:
+            np.cumsum(color_contact_capacities_np[:-1], out=color_contact_offsets_np[1:])
+
+        self.particle_body_contact_color_capacities_host = color_contact_capacities_np.tolist()
+        self.particle_body_contact_color_offsets_host = color_contact_offsets_np.tolist()
+        self.particle_body_contact_color_capacities = wp.array(
+            color_contact_capacities_np, dtype=wp.int32, device=self.device
+        )
+        self.particle_body_contact_color_offsets = wp.array(
+            color_contact_offsets_np, dtype=wp.int32, device=self.device
+        )
+        self.particle_body_contact_color_counts = wp.zeros(
+            len(color_contact_capacities_np), dtype=wp.int32, device=self.device
+        )
+        self.particle_body_contact_color_indices = wp.full(
+            int(color_contact_capacities_np.sum()), -1, dtype=wp.int32, device=self.device
+        )
 
         self.pos_prev_collision_detection = wp.zeros_like(model.particle_q, device=self.device)
         self.particle_displacements = wp.zeros(self.model.particle_count, dtype=wp.vec3, device=self.device)
@@ -1701,6 +1724,23 @@ class SolverVBD(SolverBase):
                 device=self.device,
             )
 
+        if model.particle_count > 0 and contacts is not None:
+            self.particle_body_contact_color_counts.zero_()
+            wp.launch(
+                kernel=fill_particle_body_contacts_per_color,
+                dim=contacts.soft_contact_max,
+                inputs=[
+                    contacts.soft_contact_count,
+                    contacts.soft_contact_particle,
+                    model.particle_colors,
+                    self.particle_body_contact_color_offsets,
+                    self.particle_body_contact_color_capacities,
+                    self.particle_body_contact_color_counts,
+                ],
+                outputs=[self.particle_body_contact_color_indices],
+                device=self.device,
+            )
+
     def _solve_particle_iteration(
         self, state_in: State, state_out: State, contacts: Contacts | None, dt: float, iter_num: int
     ):
@@ -1740,20 +1780,21 @@ class SolverVBD(SolverBase):
         for color in range(len(self.model.particle_color_groups)):
             if contacts is not None:
                 wp.launch(
-                    kernel=accumulate_particle_body_contact_force_and_hessian,
-                    dim=contacts.soft_contact_max,
+                    kernel=accumulate_particle_body_contact_force_and_hessian_by_color,
+                    dim=self.particle_body_contact_color_capacities_host[color],
                     inputs=[
                         dt,
                         color,
+                        self.particle_body_contact_color_offsets_host[color],
+                        self.particle_body_contact_color_capacities_host[color],
+                        self.particle_body_contact_color_counts,
+                        self.particle_body_contact_color_indices,
                         self.particle_q_prev,
                         state_in.particle_q,
-                        model.particle_colors,
                         # body-particle contact
                         self.friction_epsilon,
                         model.particle_radius,
                         contacts.soft_contact_particle,
-                        contacts.soft_contact_count,
-                        contacts.soft_contact_max,
                         self.body_particle_contact_penalty_k,
                         self.body_particle_contact_material_kd,
                         self.body_particle_contact_material_mu,
